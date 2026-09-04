@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+sqlalchemy
+requests
+pyvis
+google-genai
+groq
+pdfplumber
+PyPDF2
