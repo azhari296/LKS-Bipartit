@@ -8,3 +8,4 @@ google-genai
 groq
 pdfplumber
 PyPDF2
+streamlit-pdf-viewer
