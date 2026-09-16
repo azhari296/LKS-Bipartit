@@ -806,6 +806,130 @@ def validasi_sql(sql: str, maks_baris: int = 1000) -> str:
     return teks
 
 # =====================================================
+# GUARDRAIL — NIAT PERTANYAAN (sebelum SQL dibuat)
+# =====================================================
+# Filter ini jalan SEBELUM pertanyaan dikirim ke LLM, supaya:
+# 1) Permintaan mengubah/menghapus data lewat bahasa natural
+#    langsung ditolak (bukan cuma diblokir setelah jadi SQL —
+#    LLM bisa saja "menafsirkan ulang" jadi query SELECT biasa
+#    yang menyesatkan, seperti kasus "hilangkan data januari 2026"
+#    yang malah dijawab statistik total, bukan penolakan tegas).
+# 2) Pertanyaan yang jelas di luar topik data LKS Bipartit
+#    (trivia umum, politik, dsb) tidak diteruskan jadi query SQL
+#    yang hasilnya membingungkan ("tidak menemukan data").
+
+POLA_UBAH_DATA = re.compile(
+    r"\b("
+    r"hapus|hilangkan|buang|bersihkan|kosongkan|reset\s+data|"
+    r"timpa|ubah\s+data|edit\s+data|ganti\s+data|"
+    r"tambahkan?\s+data|masukkan\s+data|insert\s+data|"
+    r"update\s+data|drop\s+tabel|drop\s+table"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Kata kunci domain data LKS Bipartit — kalau pertanyaan mengandung salah
+# satunya, langsung diloloskan tanpa perlu panggil LLM klasifikasi.
+KATA_KUNCI_DOMAIN = (
+    "lks", "bipartit", "tema", "area", "sub area", "pegawai", "pekerja",
+    "tindak lanjut", "deadline", "status", "pln",
+    "pkb", "perjanjian kerja", "cuti", "lembur", "gaji", "tunjangan",
+    "hybrid working", "sppd", "reimburse", "diklat", "mutasi",
+    "pensiun", "rekrut", "pertemuan", "rapat", "latar belakang",
+    "rekomendasi", "unit kerja", "kode area", "kode sub", "dokumen",
+    "pdf", "laporan", "statistik", "tren", "grafik", "chart",
+    "edir", "serikat pekerja", "manajemen",
+)
+
+# Pola off-topic yang JELAS di luar domain data LKS Bipartit — dipakai
+# sebagai blocklist (bukan whitelist), supaya pertanyaan sah yang
+# kebetulan tidak memakai kata kunci domain persis tidak ikut tertolak.
+POLA_OFFTOPIC = re.compile(
+    r"\b("
+    r"presiden|capres|pemilu|pilpres|pilkada|"
+    r"cuaca|ramalan\s+cuaca|"
+    r"resep\s+masakan|cara\s+memasak|"
+    r"ibu\s?kota\s+negara|siapa\s+penemu|"
+    r"film|artis|selebriti|lagu\s+terbaru|"
+    r"skor\s+pertandingan|piala\s+dunia|liga\s+inggris|"
+    r"harga\s+bitcoin|saham\s+hari\s+ini|"
+    r"siapa\s+kamu\b|kamu\s+siapa|apa\s+kabar\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _klasifikasi_topik_llm(pertanyaan: str) -> bool | None:
+    """
+    Tanya LLM apakah pertanyaan relevan dengan data LKS Bipartit PLN.
+    Return True/False, atau None kalau LLM tidak tersedia/gagal
+    (caller harus treat None sebagai "tidak yakin, jangan blokir").
+    """
+    if USE_MOCK:
+        return None
+    try:
+        prompt = (
+            "Jawab HANYA dengan satu kata: YA atau TIDAK (tanpa penjelasan apa pun).\n"
+            "Apakah pertanyaan berikut berhubungan dengan data LKS Bipartit "
+            "(forum ketenagakerjaan PT PLN): tema pembahasan, area/unit kerja, "
+            "status tindak lanjut, PKB, cuti, gaji, hybrid working, atau isi "
+            "dokumen internal PLN terkait itu?\n\n"
+            f'Pertanyaan: "{pertanyaan}"'
+        )
+        jawab = tanya_llm(prompt).strip().lower()
+        if jawab.startswith("ya"):
+            return True
+        if jawab.startswith("tidak"):
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def cek_niat_pertanyaan(pertanyaan: str):
+    """
+    Return (ok: bool, alasan: str | None).
+    ok=False artinya pertanyaan ditolak sebelum sempat jadi SQL.
+    """
+    t = pertanyaan.strip().lower()
+
+    if not t:
+        return False, "Pertanyaan kosong."
+
+    if POLA_UBAH_DATA.search(t):
+        return False, (
+            "🔒 Permintaan untuk mengubah, menghapus, atau menambah data "
+            "tidak diizinkan lewat chat ini. Aplikasi ini bersifat **read-only** "
+            "(hanya baca/analisis). Untuk perubahan data, gunakan menu "
+            "**Update Data** yang disediakan terpisah dengan kontrol akses sendiri."
+        )
+
+    _pesan_offtopic = (
+        "🤖 Pertanyaan ini sepertinya di luar topik data **LKS Bipartit**. "
+        "Coba tanyakan hal terkait tema pembahasan, area/unit kerja, "
+        "status tindak lanjut, atau isi dokumen PKB/EDIR yang terindeks. "
+        "Lihat contoh di bagian *Pertanyaan yang Sering Ditanyakan* di atas."
+    )
+
+    if POLA_OFFTOPIC.search(t):
+        return False, _pesan_offtopic
+
+    # Kalau ada kata kunci domain yang jelas, langsung loloskan tanpa
+    # perlu panggil LLM lagi (hemat kuota & lebih cepat).
+    if any(k in t for k in KATA_KUNCI_DOMAIN):
+        return True, None
+
+    # Ambigu (tidak match blocklist, tidak match keyword domain) →
+    # cek ke LLM. Kalau LLM tidak tersedia/gagal, jangan blokir
+    # (biar SQL guardrail & fallback yang lebih spesifik yang menangani).
+    hasil = _klasifikasi_topik_llm(pertanyaan)
+    if hasil is False:
+        return False, _pesan_offtopic
+
+    return True, None
+
+
+# =====================================================
 # FUNGSI UTAMA
 # =====================================================
 
@@ -2151,526 +2275,542 @@ if (jalankan_btn or _auto_run) and query:
     if not DATA_SIAP:
         st.error(f"⚠️ Data tidak tersedia: {DATA_ERROR}")
     else:
-        # ── Deteksi apakah pertanyaan tentang dokumen ───────
-        # Init default agar tidak NoneType error
-        df, sql, error = None, None, None
-
-        _is_dok     = is_pertanyaan_dokumen(query)
-        _dok_chunks = cari_dokumen(query) if _is_dok else []
-
-        # Info RAG kecil (hanya jika relevan)
-        if _is_dok and _dok_chunks:
-            st.caption(
-                f"📄 RAG aktif — {len(_rag_index)} dok terindeks, "
-                f"{len(_dok_chunks)} bagian relevan ditemukan"
-            )
-
-        if _dok_chunks:
-            # ── Mode RAG: jawab dari dokumen ──────────────────
-            with st.spinner("📄 Mencari di dokumen..."):
-                jawaban_rag = jawab_dengan_rag(query, _dok_chunks)
-
-            st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Jawaban dari Dokumen</p>", unsafe_allow_html=True)
-            st.markdown(jawaban_rag)
-
-            # ── Preview PDF langsung di app ──────────────────
-            file_unik = list(dict.fromkeys(c["file"] for c in _dok_chunks))
-            if file_unik:
-                st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Preview Dokumen</p>", unsafe_allow_html=True)
-                _tab_labels = file_unik[:3]
-                _tabs = st.tabs(_tab_labels)
-                for _ti, _fname in enumerate(_tab_labels):
-                    with _tabs[_ti]:
-                        # Cari URL file
-                        _furl = _rag_urls.get(_fname)
-                        if not _furl:
-                            # Cari dari _dok_chunks
-                            for _c in _dok_chunks:
-                                if _c["file"] == _fname:
-                                    _furl = _get_public_url(_c)
-                                    break
-                        if _furl:
-                            _render_pdf_preview(_furl)
-                            st.markdown(
-                                f"<a href='{_furl}' target='_blank' "
-                                f"style='font-size:0.85rem;'>↗ Buka di tab baru</a>",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            st.info("URL dokumen tidak tersedia")
-
-            with st.expander("📎 Lihat potongan teks yang digunakan", expanded=False):
-                for c in _dok_chunks:
-                    st.markdown(f"**{c['file']}** — {c['bagian']} (relevansi: {c['skor']})")
-                    isi = c["chunk"].strip()
-                    if len(isi) < 50:
-                        st.warning(
-                            f"⚠️ Teks sangat sedikit ({len(isi)} karakter). "
-                            "PDF ini mungkin berupa scan/gambar — "
-                            "coba upload versi PDF yang bisa di-copy teksnya."
-                        )
-                    else:
-                        st.caption(isi[:500] + ("..." if len(isi) > 500 else ""))
-                    st.divider()
-
-            st.session_state.history.append({
-                "question": query,
-                "sql":      f"[RAG: {', '.join(c['file'] for c in _dok_chunks)}]",
-                "rows":     0,
-            })
-
-        elif _is_dok and not _dok_chunks:
-            # ── Dokumen terdeteksi tapi index kosong ──────────
+        _niat_ok, _niat_pesan = cek_niat_pertanyaan(query)
+        if not _niat_ok:
             st.markdown(
                 "<div style='background:#FFF8E1;border-left:4px solid #FFA000;"
-                "border-radius:8px;padding:14px 18px;margin:8px 0;'>"
-                "<b>📂 Dokumen ditemukan di Supabase tapi belum bisa dibaca.</b><br>"
-                "Kemungkinan: PDF terenkripsi atau butuh pdfplumber.<br>"
-                f"File di bucket: {', '.join(f['name'] for f in _list_dokumen_supabase()) or 'tidak ada'}"
+                "border-radius:8px;padding:14px 18px;margin:8px 0;"
+                "color:#5C4A1E;'>"
+                f"{_niat_pesan}"
                 "</div>",
                 unsafe_allow_html=True,
             )
-
+            st.session_state.history.append({
+                "question": query,
+                "sql":      "[DITOLAK OLEH GUARDRAIL]",
+                "rows":     0,
+            })
         else:
-            # ── Mode SQL: query ke database ───────────────────
-            with st.spinner("🤖 Sedang menganalisis data..."):
-                df, sql, error = jalankan_query(query)
+            # ── Deteksi apakah pertanyaan tentang dokumen ───────
+            # Init default agar tidak NoneType error
+            df, sql, error = None, None, None
 
+            _is_dok     = is_pertanyaan_dokumen(query)
+            _dok_chunks = cari_dokumen(query) if _is_dok else []
 
-            # ── ERROR + FALLBACK LLM ──────────────────────────
-            if error:
-                with st.spinner("🤔 Menganalisis pertanyaan Anda..."):
-                    saran = tanya_fallback_llm(query)
+            # Info RAG kecil (hanya jika relevan)
+            if _is_dok and _dok_chunks:
+                st.caption(
+                    f"📄 RAG aktif — {len(_rag_index)} dok terindeks, "
+                    f"{len(_dok_chunks)} bagian relevan ditemukan"
+                )
+
+            if _dok_chunks:
+                # ── Mode RAG: jawab dari dokumen ──────────────────
+                with st.spinner("📄 Mencari di dokumen..."):
+                    jawaban_rag = jawab_dengan_rag(query, _dok_chunks)
+
+                st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Jawaban dari Dokumen</p>", unsafe_allow_html=True)
+                st.markdown(jawaban_rag)
+
+                # ── Preview PDF langsung di app ──────────────────
+                file_unik = list(dict.fromkeys(c["file"] for c in _dok_chunks))
+                if file_unik:
+                    st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Preview Dokumen</p>", unsafe_allow_html=True)
+                    _tab_labels = file_unik[:3]
+                    _tabs = st.tabs(_tab_labels)
+                    for _ti, _fname in enumerate(_tab_labels):
+                        with _tabs[_ti]:
+                            # Cari URL file
+                            _furl = _rag_urls.get(_fname)
+                            if not _furl:
+                                # Cari dari _dok_chunks
+                                for _c in _dok_chunks:
+                                    if _c["file"] == _fname:
+                                        _furl = _get_public_url(_c)
+                                        break
+                            if _furl:
+                                _render_pdf_preview(_furl)
+                                st.markdown(
+                                    f"<a href='{_furl}' target='_blank' "
+                                    f"style='font-size:0.85rem;'>↗ Buka di tab baru</a>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.info("URL dokumen tidak tersedia")
+
+                with st.expander("📎 Lihat potongan teks yang digunakan", expanded=False):
+                    for c in _dok_chunks:
+                        st.markdown(f"**{c['file']}** — {c['bagian']} (relevansi: {c['skor']})")
+                        isi = c["chunk"].strip()
+                        if len(isi) < 50:
+                            st.warning(
+                                f"⚠️ Teks sangat sedikit ({len(isi)} karakter). "
+                                "PDF ini mungkin berupa scan/gambar — "
+                                "coba upload versi PDF yang bisa di-copy teksnya."
+                            )
+                        else:
+                            st.caption(isi[:500] + ("..." if len(isi) > 500 else ""))
+                        st.divider()
+
+                st.session_state.history.append({
+                    "question": query,
+                    "sql":      f"[RAG: {', '.join(c['file'] for c in _dok_chunks)}]",
+                    "rows":     0,
+                })
+
+            elif _is_dok and not _dok_chunks:
+                # ── Dokumen terdeteksi tapi index kosong ──────────
                 st.markdown(
-                    "<div style='background:linear-gradient(135deg,#FFF8E1,#FFF3E0);"
-                    "border-left:5px solid #FFA000;border-radius:8px;"
-                    "padding:18px 22px;margin:12px 0;'>"
-                    "<p style='font-size:1.1rem;font-weight:700;"
-                    "color:#E65100;margin:0 0 10px 0;'>"
-                    "🤔 Hmm, saya belum bisa menjawab pertanyaan itu...</p>"
-                    f"<p style='font-size:0.93rem;color:#444;margin:0;"
-                    f"white-space:pre-line;line-height:1.7;'>{saran}</p>"
+                    "<div style='background:#FFF8E1;border-left:4px solid #FFA000;"
+                    "border-radius:8px;padding:14px 18px;margin:8px 0;'>"
+                    "<b>📂 Dokumen ditemukan di Supabase tapi belum bisa dibaca.</b><br>"
+                    "Kemungkinan: PDF terenkripsi atau butuh pdfplumber.<br>"
+                    f"File di bucket: {', '.join(f['name'] for f in _list_dokumen_supabase()) or 'tidak ada'}"
                     "</div>",
                     unsafe_allow_html=True,
                 )
 
-            # ── SUKSES ───────────────────────────────────────
-            elif df is not None:
-                st.session_state.history.append({
-                    "question": query,
-                    "sql":      sql,
-                    "rows":     len(df),
-                })
-
-        # ── Tampilkan hasil SQL jika ada ─────────────────────
-        if df is not None and sql is not None and error is None:
-            # ── 🤖 RINGKASAN ─────────────────────────────────
-            tipe_chart = deteksi_chart(df)
-
-            st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Ringkasan</p>", unsafe_allow_html=True)
-            if len(df) == 0:
-                st.info("Query berhasil dijalankan namun tidak menemukan data.")
-            elif tipe_chart == "metric":
-                nilai = df.iloc[0, 0]
-                nama  = df.columns[0].replace("_", " ").title()
-                st.metric(nama, f"{nilai:,}")
             else:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("📋 Total Baris",  f"{len(df):,}")
-                c2.metric("🗂️ Kolom",        f"{len(df.columns)}")
-                # Kolom numerik → tampilkan sum/rata-rata
-                num_cols = df.select_dtypes(include="number").columns.tolist()
-                if num_cols:
-                    col_n = num_cols[0]
-                    c3.metric(f"∑ {col_n.replace('_',' ').title()}", f"{df[col_n].sum():,.0f}")
-                elif "status_tindak_lanjut" in df.columns:
-                    n_belum = (df["status_tindak_lanjut"] == "Belum").sum()
-                    c3.metric("⏳ Belum TL", f"{n_belum:,}")
-                elif "kode_area" in df.columns:
-                    c3.metric("📍 Area", f"{df['kode_area'].nunique():,}")
+                # ── Mode SQL: query ke database ───────────────────
+                with st.spinner("🤖 Sedang menganalisis data..."):
+                    df, sql, error = jalankan_query(query)
 
-            # ── 🗄️ SQL (tersembunyi default) ─────────────────
-            with st.expander("🗄️ Lihat SQL Query", expanded=False):
-                st.code(sql, language="sql")
 
-            # ── 🕸️ Network Graph korelasi tema (pyvis) ───────────────
-            if "tema" in df.columns and len(df) > 0 and PYVIS_OK:
-                _tema_cnt = df["tema"].value_counts()
-                if len(_tema_cnt) >= 2:
-                    with st.expander("🕸️ Network Graph — Korelasi Antar Tema", expanded=False):
-                        st.caption("Ukuran node = jumlah kemunculan · Tebal edge = area yang sama")
+                # ── ERROR + FALLBACK LLM ──────────────────────────
+                if error:
+                    with st.spinner("🤔 Menganalisis pertanyaan Anda..."):
+                        saran = tanya_fallback_llm(query)
+                    st.markdown(
+                        "<div style='background:linear-gradient(135deg,#FFF8E1,#FFF3E0);"
+                        "border-left:5px solid #FFA000;border-radius:8px;"
+                        "padding:18px 22px;margin:12px 0;'>"
+                        "<p style='font-size:1.1rem;font-weight:700;"
+                        "color:#E65100;margin:0 0 10px 0;'>"
+                        "🤔 Hmm, saya belum bisa menjawab pertanyaan itu...</p>"
+                        f"<p style='font-size:0.93rem;color:#444;margin:0;"
+                        f"white-space:pre-line;line-height:1.7;'>{saran}</p>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                        # Buat network
-                        _g = pvnet.Network(
-                            height="520px", width="100%",
-                            bgcolor="#FAF2EA", font_color="#0A0204",
-                            directed=False,
-                        )
-                        _g.set_options("""{
-                          "nodes": {
-                            "font": {"size": 13, "face": "Inter, sans-serif"},
-                            "borderWidth": 1.5,
-                            "shadow": {"enabled": true, "color": "rgba(0,0,0,0.1)", "size": 6}
-                          },
-                          "edges": {
-                            "color": {"color": "#D8CDBF", "highlight": "#7A1428"},
-                            "smooth": {"type": "continuous"},
-                            "shadow": false
-                          },
-                          "physics": {
-                            "forceAtlas2Based": {
-                              "gravitationalConstant": -50,
-                              "centralGravity": 0.01,
-                              "springLength": 120
-                            },
-                            "solver": "forceAtlas2Based",
-                            "stabilization": {"iterations": 150}
-                          },
-                          "interaction": {"hover": true, "tooltipDelay": 100}
-                        }""")
+                # ── SUKSES ───────────────────────────────────────
+                elif df is not None:
+                    st.session_state.history.append({
+                        "question": query,
+                        "sql":      sql,
+                        "rows":     len(df),
+                    })
 
-                        # Warna node berdasarkan jumlah
-                        _max_cnt = _tema_cnt.max()
-                        for _tema, _cnt in _tema_cnt.items():
-                            # Gradasi warna: sedikit=gold, banyak=burgundy
-                            _ratio   = _cnt / _max_cnt
-                            _r = int(122 + (10 - 122) * _ratio)
-                            _g2 = int(20 + (2 - 20) * _ratio)
-                            _b = int(40 + (4 - 40) * _ratio)
-                            _color   = f"#{_r:02x}{_g2:02x}{_b:02x}"
-                            _size    = max(18, min(50, 18 + int(_ratio * 32)))
-                            _label   = str(_tema)[:22] + ("…" if len(str(_tema)) > 22 else "")
-                            _g.add_node(
-                                str(_tema), label=_label,
-                                title=f"{_tema}: {_cnt} pertemuan",
-                                color=_color, size=_size,
-                                font={"color": "#FAF2EA" if _ratio > 0.5 else "#0A0204"},
-                            )
+            # ── Tampilkan hasil SQL jika ada ─────────────────────
+            if df is not None and sql is not None and error is None:
+                # ── 🤖 RINGKASAN ─────────────────────────────────
+                tipe_chart = deteksi_chart(df)
 
-                        # Edge: hubungkan tema yang muncul di area yang sama
-                        if "kode_area" in df.columns:
-                            _area_tema = df.groupby("kode_area")["tema"].apply(list)
-                            _edge_w = {}
-                            for _area, _tlist in _area_tema.items():
-                                _uniq = list(set(_tlist))
-                                for _i in range(len(_uniq)):
-                                    for _j in range(_i+1, len(_uniq)):
-                                        _k = (str(_uniq[_i]), str(_uniq[_j]))
-                                        _k = (_k[0], _k[1]) if _k[0] < _k[1] else (_k[1], _k[0])
-                                        _edge_w[_k] = _edge_w.get(_k, 0) + 1
-                            # Ambil top 40 edge terkuat
-                            for (_a, _b2), _w in sorted(
-                                _edge_w.items(), key=lambda x: -x[1]
-                            )[:40]:
-                                if _a in [str(t) for t in _tema_cnt.index] and                                    _b2 in [str(t) for t in _tema_cnt.index]:
-                                    _g.add_edge(
-                                        _a, _b2,
-                                        value=_w,
-                                        title=f"Bersama di {_w} area",
-                                        width=max(1, min(6, _w // 2)),
-                                    )
-
-                        pv_static(_g)
-
-            # ── 🕸️ Mermaid: hubungan antar tema (selalu tampil jika ada tema) ──
-            if "tema" in df.columns and len(df) > 0:
-                _tema_counts = df["tema"].value_counts()
-                if len(_tema_counts) >= 2:
-                    with st.expander("🕸️ Lihat Hubungan Antar Tema", expanded=False):
-                        # Bangun diagram Mermaid mindmap
-                        _top_tema = _tema_counts.head(8)
-                        _mermaid_lines = ["mindmap", "  root((LKS Bipartit))"]
-                        _kategori = {
-                            "Manajemen": ["manajemen", "penghargaan", "talenta", "rekrutmen", "promosi"],
-                            "Hubungan Industrial": ["lks", "bipartit", "pkb", "perjanjian", "sp "],
-                            "Fasilitas": ["fasilitas", "sppd", "perjalanan", "reimburse", "hardware"],
-                            "Kesehatan": ["kesehatan", "wellbeing", "bpjs", "cuti", "melahirkan"],
-                            "Lainnya": [],
-                        }
-                        _grouped = {k: [] for k in _kategori}
-                        for _tema, _cnt in _top_tema.items():
-                            _t_low = str(_tema).lower()
-                            _placed = False
-                            for _kat, _kw in _kategori.items():
-                                if _kw and any(k in _t_low for k in _kw):
-                                    _grouped[_kat].append((_tema, _cnt))
-                                    _placed = True
-                                    break
-                            if not _placed:
-                                _grouped["Lainnya"].append((_tema, _cnt))
-
-                        for _kat, _items in _grouped.items():
-                            if not _items:
-                                continue
-                            _safe_kat = _kat
-                            _mermaid_lines.append(f"    {_safe_kat}")
-                            for _tema, _cnt in _items:
-                                _safe = str(_tema)[:30].replace('"', "'")
-                                _mermaid_lines.append(f'      {_safe} [{_cnt}x]')
-
-                        _mermaid_code = "\n".join(_mermaid_lines)
-                        st.markdown(
-                            f"<div class='mermaid'>{_mermaid_code}</div>"
-                            "<script src='https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js'></script>"
-                            "<script>mermaid.initialize({startOnLoad:true, theme:'base',"
-                            "themeVariables:{primaryColor:'#4A0E1F',primaryTextColor:'#FAF5EE',"
-                            "primaryBorderColor:'#C9A84C',lineColor:'#C9A84C',"
-                            "secondaryColor:'#6B1527',tertiaryColor:'#FDF3DC'}});</script>",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(
-                            "Diagram otomatis dari hasil query. "
-                            "Angka dalam [ ] menunjukkan jumlah kemunculan tema."
-                        )
-
-            # ── 📊 HASIL + VISUALISASI INTERAKTIF ────────────
-            _skip_table = "latar_belakang" in df.columns if df is not None and len(df) > 0 else False
-            if len(df) > 0 and tipe_chart != "metric":
-                if not _skip_table:
-                    st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Hasil</p>", unsafe_allow_html=True)
-
-                if tipe_chart in ("bar", "pie"):
-                    col_label = df.columns[0]
-                    col_val   = df.columns[1]
-
-                    # ── Bar chart interaktif + klik untuk detail ──
-                    if tipe_chart == "bar":
-                        # Siapkan data detail per tema (jika ada)
-                        _has_detail = col_label in ("tema", "kode_area")
-
-                        fig = px.bar(
-                            df,
-                            x=col_val,
-                            y=col_label,
-                            orientation="h",
-                            text=col_val,
-                            color=col_val,
-                            color_continuous_scale=[
-                                [0, "#FDF3DC"], [0.4, "#C9A84C"],
-                                [0.7, "#8B2035"], [1, "#2D0812"]
-                            ],
-                            custom_data=[col_label],
-                        )
-                        fig.update_traces(
-                            textposition="outside",
-                            hovertemplate=(
-                                "<b>%{y}</b><br>"
-                                f"{col_val.replace('_',' ').title()}: %{{x:,}}<br>"
-                                "<i>Klik untuk lihat detail</i>"
-                                "<extra></extra>"
-                            ),
-                        )
-                        fig.update_layout(
-                            yaxis={"categoryorder": "total ascending",
-                                   "tickfont": {"size": 11}},
-                            xaxis={"title": col_val.replace("_", " ").title()},
-                            height=max(420, len(df) * 32),
-                            showlegend=False,
-                            coloraxis_showscale=False,
-                            margin=dict(l=10, r=80, t=40, b=30),
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            font=dict(color="#2D0812"),
-                            hoverlabel=dict(
-                                bgcolor="#4A0E1F",
-                                font_color="#FAF5EE",
-                                font_size=13,
-                            ),
-                        )
-                        fig.update_xaxes(showgrid=True, gridcolor="#E8D5B0",
-                                         gridwidth=0.5)
-                        fig.update_yaxes(showgrid=False)
-
-                        st.plotly_chart(fig, use_container_width=True,
-                                        key="main_chart")
-
-                        # Detail langsung dari hasil query (tidak perlu dropdown)
-
-                    # ── Donut chart untuk data kecil ─────────────
-                    elif tipe_chart == "pie":
-                        fig = px.pie(
-                            df,
-                            names=col_label,
-                            values=col_val,
-                            hole=0.45,
-                            color_discrete_sequence=px.colors.sequential.RdPu_r,
-                        )
-                        fig.update_traces(
-                            textposition="inside",
-                            textinfo="percent+label",
-                            hovertemplate=(
-                                "<b>%{label}</b><br>"
-                                "Jumlah: %{value:,}<br>"
-                                "Porsi: %{percent}<extra></extra>"
-                            ),
-                        )
-                        fig.update_layout(
-                            height=420,
-                            showlegend=True,
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            font=dict(color="#2D0812"),
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
+                st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Ringkasan</p>", unsafe_allow_html=True)
+                if len(df) == 0:
+                    st.info("Query berhasil dijalankan namun tidak menemukan data.")
+                elif tipe_chart == "metric":
+                    nilai = df.iloc[0, 0]
+                    nama  = df.columns[0].replace("_", " ").title()
+                    st.metric(nama, f"{nilai:,}")
                 else:
-                    # Tabel detail biasa — skip jika kartu detail sudah tampil
-                    if not _skip_table:
-                        st.dataframe(df, use_container_width=True, height=350)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("📋 Total Baris",  f"{len(df):,}")
+                    c2.metric("🗂️ Kolom",        f"{len(df.columns)}")
+                    # Kolom numerik → tampilkan sum/rata-rata
+                    num_cols = df.select_dtypes(include="number").columns.tolist()
+                    if num_cols:
+                        col_n = num_cols[0]
+                        c3.metric(f"∑ {col_n.replace('_',' ').title()}", f"{df[col_n].sum():,.0f}")
+                    elif "status_tindak_lanjut" in df.columns:
+                        n_belum = (df["status_tindak_lanjut"] == "Belum").sum()
+                        c3.metric("⏳ Belum TL", f"{n_belum:,}")
+                    elif "kode_area" in df.columns:
+                        c3.metric("📍 Area", f"{df['kode_area'].nunique():,}")
 
-                # Download selalu ada
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name="hasil_lks.csv",
-                    mime="text/csv",
-                )
+                # ── 🗄️ SQL (tersembunyi default) ─────────────────
+                with st.expander("🗄️ Lihat SQL Query", expanded=False):
+                    st.code(sql, language="sql")
 
-                # ── Kartu pembahasan berwarna jika ada kolom relevan ──
-                _has_detail_cols = (
-                    "latar_belakang" in df.columns
-                    and tipe_chart not in ("metric", "pie", "bar")
-                )
-                if _has_detail_cols and len(df) > 0:
-                    render_detail_pembahasan(df)
+                # ── 🕸️ Network Graph korelasi tema (pyvis) ───────────────
+                if "tema" in df.columns and len(df) > 0 and PYVIS_OK:
+                    _tema_cnt = df["tema"].value_counts()
+                    if len(_tema_cnt) >= 2:
+                        with st.expander("🕸️ Network Graph — Korelasi Antar Tema", expanded=False):
+                            st.caption("Ukuran node = jumlah kemunculan · Tebal edge = area yang sama")
 
-            # ── 🌳 TREE VIEW ──────────────────────────────────
-            KOLOM_TEKS = ["latar_belakang", "rekomendasi", "tindak_lanjut"]
-            ada_teks   = [c for c in KOLOM_TEKS if c in df.columns]
-
-            # Jika ada kolom teks tapi data terbatas (LIMIT 10), re-query tanpa limit
-            if ada_teks and len(df) > 0 and len(df) <= 10:
-                try:
-                    with engine.connect() as _rc:
-                        _sql_full = re.sub(
-                            r"\bLIMIT\s+\d+", "LIMIT 2000", sql, flags=re.IGNORECASE
-                        )
-                        df = pd.read_sql(text(_sql_full), _rc)
-                except Exception:
-                    pass  # pakai df yang ada jika re-query gagal
-
-            if ada_teks and len(df) > 0:
-                st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Pengelompokkan Topik</p>", unsafe_allow_html=True)
-                st.caption(
-                    "Baris dikelompokkan berdasarkan topik/frasa yang sering muncul. "
-                    "Pilih kolom lalu klik grup untuk melihat detailnya."
-                )
-
-                STOPWORDS = {
-                    "yang","dan","di","ke","dari","dengan","untuk","pada","dalam",
-                    "adalah","ini","itu","atau","juga","sudah","telah","akan",
-                    "tidak","ada","oleh","para","agar","dapat","serta","karena",
-                    "namun","sebagai","sesuai","terkait","terdapat","bahwa","hal",
-                    "kami","unit","pln","bersama","bidang","lks","bipartit",
-                    "mengenai","menindaklanjuti","pembahasan","menyampaikan",
-                    "berdasarkan","saat","masih","belum","kepada","antara","tim",
-                    "anggota","pihak","dinas","meminta","memiliki","dilakukan",
-                    "tersebut","lebih","proses","pegawai","perlu","nomor","surat",
-                    "adanya","hasil",
-                }
-                FRASA_PRIORITAS = [
-                    "aplikasi e-sppd","esppd","e-sppd","e sppd",
-                    "reimburse","reimbursement","perjalanan dinas","optimasi biaya",
-                    "non diklat","non-diklat","tugas belajar","emergency exit",
-                    "printer","laptop","hardware","pkb","perjanjian kerja",
-                    "rekrutmen","rekrut","kesehatan","wellbeing","cuti","melahirkan",
-                    "lembur","overtime","pagu","anggaran","kompetensi",
-                    "pelatihan","diklat","jabatan","promosi","mutasi","pensiun","purna",
-                ]
-
-                def cari_frasa(teks):
-                    t = str(teks).lower()
-                    return [f for f in FRASA_PRIORITAS if f in t]
-
-                def ekstrak_topik(seri, max_topik=8):
-                    from collections import Counter
-                    fc = Counter()
-                    for t in seri.dropna():
-                        for f in cari_frasa(t):
-                            fc[f] += 1
-                    topik = [f for f, _ in fc.most_common(max_topik)]
-                    if len(topik) < 3:
-                        semua = []
-                        for t in seri.dropna():
-                            kata = [k for k in re.findall(r"\b[a-zA-Z]{4,}\b", str(t).lower())
-                                    if k not in STOPWORDS]
-                            semua += [f"{kata[i]} {kata[i+1]}" for i in range(len(kata)-1)]
-                            semua += kata
-                        topik += [b for b, _ in Counter(semua).most_common(20)
-                                  if b not in topik][: max_topik - len(topik)]
-                    return topik[:max_topik]
-
-                def tag_baris(teks, topik_list):
-                    t = str(teks).lower()
-                    for tp in topik_list:
-                        if tp in t:
-                            return tp
-                    return "lainnya"
-
-                pilih_kolom = st.selectbox(
-                    "Tampilkan kolom:",
-                    options=ada_teks,
-                    format_func=lambda x: x.replace("_", " ").title(),
-                    key="tree_kolom",
-                )
-
-                df_isi = df[
-                    df[pilih_kolom].notna() &
-                    (df[pilih_kolom].str.strip() != "")
-                ].copy()
-
-                if df_isi.empty:
-                    st.info("Tidak ada data untuk ditampilkan.")
-                else:
-                    topik_list = ekstrak_topik(df_isi[pilih_kolom])
-                    df_isi["_topik"] = df_isi[pilih_kolom].apply(lambda t: tag_baris(t, topik_list))
-                    urutan = [t for t in topik_list if t in df_isi["_topik"].values]
-                    if "lainnya" in df_isi["_topik"].values:
-                        urutan += ["lainnya"]
-
-                    WARNA = ["#1565C0","#2E7D32","#6A1B9A","#BF360C","#00695C",
-                             "#E65100","#4527A0","#283593","#558B2F","#AD1457","#888"]
-
-                    for i_tp, topik in enumerate(urutan):
-                        subset = df_isi[df_isi["_topik"] == topik]
-                        if subset.empty:
-                            continue
-                        n     = len(subset)
-                        w     = WARNA[i_tp % len(WARNA)] if topik != "lainnya" else "#888"
-                        areas = ""
-                        if "kode_area" in subset.columns:
-                            alist = sorted(subset["kode_area"].dropna().unique())[:12]
-                            areas = " ".join(
-                                f"<span style='background:#EEE;color:#555;padding:0 5px;"
-                                f"border-radius:3px;font-size:0.72rem;'>{a}</span>"
-                                for a in alist
+                            # Buat network
+                            _g = pvnet.Network(
+                                height="520px", width="100%",
+                                bgcolor="#FAF2EA", font_color="#0A0204",
+                                directed=False,
                             )
-                        st.markdown(
-                            f"<div style='margin:12px 0 4px 0;'>"
-                            f"<span style='background:{w};color:white;padding:3px 12px;"
-                            f"border-radius:12px;font-size:0.82rem;font-weight:700;'>"
-                            f"📌 {topik.upper()}</span>"
-                            f"<span style='color:#888;font-size:0.8rem;margin-left:8px;'>"
-                            f"{n} baris</span> &nbsp;{areas}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        with st.expander(f"Lihat {n} detail →", expanded=False):
-                            for _, row in subset.iterrows():
-                                ab = ""
-                                if "kode_area" in row and pd.notna(row["kode_area"]):
-                                    ab = (f"<span style='background:#E3F2FD;color:#1565C0;"
-                                          f"padding:1px 7px;border-radius:4px;font-size:0.74rem;"
-                                          f"margin-right:6px;font-weight:600;'>{row['kode_area']}</span>")
-                                raw   = str(row[pilih_kolom])
-                                shown = raw[:300] + "…" if len(raw) > 300 else raw
-                                st.markdown(
-                                    f"<div style='margin:4px 0;padding:6px 10px;"
-                                    f"border-left:3px solid {w};background:#FAFAFA;"
-                                    f"font-size:0.875rem;color:#333;border-radius:0 4px 4px 0;'>"
-                                    f"{ab}{shown}</div>",
-                                    unsafe_allow_html=True,
+                            _g.set_options("""{
+                              "nodes": {
+                                "font": {"size": 13, "face": "Inter, sans-serif"},
+                                "borderWidth": 1.5,
+                                "shadow": {"enabled": true, "color": "rgba(0,0,0,0.1)", "size": 6}
+                              },
+                              "edges": {
+                                "color": {"color": "#D8CDBF", "highlight": "#7A1428"},
+                                "smooth": {"type": "continuous"},
+                                "shadow": false
+                              },
+                              "physics": {
+                                "forceAtlas2Based": {
+                                  "gravitationalConstant": -50,
+                                  "centralGravity": 0.01,
+                                  "springLength": 120
+                                },
+                                "solver": "forceAtlas2Based",
+                                "stabilization": {"iterations": 150}
+                              },
+                              "interaction": {"hover": true, "tooltipDelay": 100}
+                            }""")
+
+                            # Warna node berdasarkan jumlah
+                            _max_cnt = _tema_cnt.max()
+                            for _tema, _cnt in _tema_cnt.items():
+                                # Gradasi warna: sedikit=gold, banyak=burgundy
+                                _ratio   = _cnt / _max_cnt
+                                _r = int(122 + (10 - 122) * _ratio)
+                                _g2 = int(20 + (2 - 20) * _ratio)
+                                _b = int(40 + (4 - 40) * _ratio)
+                                _color   = f"#{_r:02x}{_g2:02x}{_b:02x}"
+                                _size    = max(18, min(50, 18 + int(_ratio * 32)))
+                                _label   = str(_tema)[:22] + ("…" if len(str(_tema)) > 22 else "")
+                                _g.add_node(
+                                    str(_tema), label=_label,
+                                    title=f"{_tema}: {_cnt} pertemuan",
+                                    color=_color, size=_size,
+                                    font={"color": "#FAF2EA" if _ratio > 0.5 else "#0A0204"},
                                 )
-                            st.markdown("")
+
+                            # Edge: hubungkan tema yang muncul di area yang sama
+                            if "kode_area" in df.columns:
+                                _area_tema = df.groupby("kode_area")["tema"].apply(list)
+                                _edge_w = {}
+                                for _area, _tlist in _area_tema.items():
+                                    _uniq = list(set(_tlist))
+                                    for _i in range(len(_uniq)):
+                                        for _j in range(_i+1, len(_uniq)):
+                                            _k = (str(_uniq[_i]), str(_uniq[_j]))
+                                            _k = (_k[0], _k[1]) if _k[0] < _k[1] else (_k[1], _k[0])
+                                            _edge_w[_k] = _edge_w.get(_k, 0) + 1
+                                # Ambil top 40 edge terkuat
+                                for (_a, _b2), _w in sorted(
+                                    _edge_w.items(), key=lambda x: -x[1]
+                                )[:40]:
+                                    if _a in [str(t) for t in _tema_cnt.index] and                                    _b2 in [str(t) for t in _tema_cnt.index]:
+                                        _g.add_edge(
+                                            _a, _b2,
+                                            value=_w,
+                                            title=f"Bersama di {_w} area",
+                                            width=max(1, min(6, _w // 2)),
+                                        )
+
+                            pv_static(_g)
+
+                # ── 🕸️ Mermaid: hubungan antar tema (selalu tampil jika ada tema) ──
+                if "tema" in df.columns and len(df) > 0:
+                    _tema_counts = df["tema"].value_counts()
+                    if len(_tema_counts) >= 2:
+                        with st.expander("🕸️ Lihat Hubungan Antar Tema", expanded=False):
+                            # Bangun diagram Mermaid mindmap
+                            _top_tema = _tema_counts.head(8)
+                            _mermaid_lines = ["mindmap", "  root((LKS Bipartit))"]
+                            _kategori = {
+                                "Manajemen": ["manajemen", "penghargaan", "talenta", "rekrutmen", "promosi"],
+                                "Hubungan Industrial": ["lks", "bipartit", "pkb", "perjanjian", "sp "],
+                                "Fasilitas": ["fasilitas", "sppd", "perjalanan", "reimburse", "hardware"],
+                                "Kesehatan": ["kesehatan", "wellbeing", "bpjs", "cuti", "melahirkan"],
+                                "Lainnya": [],
+                            }
+                            _grouped = {k: [] for k in _kategori}
+                            for _tema, _cnt in _top_tema.items():
+                                _t_low = str(_tema).lower()
+                                _placed = False
+                                for _kat, _kw in _kategori.items():
+                                    if _kw and any(k in _t_low for k in _kw):
+                                        _grouped[_kat].append((_tema, _cnt))
+                                        _placed = True
+                                        break
+                                if not _placed:
+                                    _grouped["Lainnya"].append((_tema, _cnt))
+
+                            for _kat, _items in _grouped.items():
+                                if not _items:
+                                    continue
+                                _safe_kat = _kat
+                                _mermaid_lines.append(f"    {_safe_kat}")
+                                for _tema, _cnt in _items:
+                                    _safe = str(_tema)[:30].replace('"', "'")
+                                    _mermaid_lines.append(f'      {_safe} [{_cnt}x]')
+
+                            _mermaid_code = "\n".join(_mermaid_lines)
+                            st.markdown(
+                                f"<div class='mermaid'>{_mermaid_code}</div>"
+                                "<script src='https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js'></script>"
+                                "<script>mermaid.initialize({startOnLoad:true, theme:'base',"
+                                "themeVariables:{primaryColor:'#4A0E1F',primaryTextColor:'#FAF5EE',"
+                                "primaryBorderColor:'#C9A84C',lineColor:'#C9A84C',"
+                                "secondaryColor:'#6B1527',tertiaryColor:'#FDF3DC'}});</script>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(
+                                "Diagram otomatis dari hasil query. "
+                                "Angka dalam [ ] menunjukkan jumlah kemunculan tema."
+                            )
+
+                # ── 📊 HASIL + VISUALISASI INTERAKTIF ────────────
+                _skip_table = "latar_belakang" in df.columns if df is not None and len(df) > 0 else False
+                if len(df) > 0 and tipe_chart != "metric":
+                    if not _skip_table:
+                        st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Hasil</p>", unsafe_allow_html=True)
+
+                    if tipe_chart in ("bar", "pie"):
+                        col_label = df.columns[0]
+                        col_val   = df.columns[1]
+
+                        # ── Bar chart interaktif + klik untuk detail ──
+                        if tipe_chart == "bar":
+                            # Siapkan data detail per tema (jika ada)
+                            _has_detail = col_label in ("tema", "kode_area")
+
+                            fig = px.bar(
+                                df,
+                                x=col_val,
+                                y=col_label,
+                                orientation="h",
+                                text=col_val,
+                                color=col_val,
+                                color_continuous_scale=[
+                                    [0, "#FDF3DC"], [0.4, "#C9A84C"],
+                                    [0.7, "#8B2035"], [1, "#2D0812"]
+                                ],
+                                custom_data=[col_label],
+                            )
+                            fig.update_traces(
+                                textposition="outside",
+                                hovertemplate=(
+                                    "<b>%{y}</b><br>"
+                                    f"{col_val.replace('_',' ').title()}: %{{x:,}}<br>"
+                                    "<i>Klik untuk lihat detail</i>"
+                                    "<extra></extra>"
+                                ),
+                            )
+                            fig.update_layout(
+                                yaxis={"categoryorder": "total ascending",
+                                       "tickfont": {"size": 11}},
+                                xaxis={"title": col_val.replace("_", " ").title()},
+                                height=max(420, len(df) * 32),
+                                showlegend=False,
+                                coloraxis_showscale=False,
+                                margin=dict(l=10, r=80, t=40, b=30),
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#2D0812"),
+                                hoverlabel=dict(
+                                    bgcolor="#4A0E1F",
+                                    font_color="#FAF5EE",
+                                    font_size=13,
+                                ),
+                            )
+                            fig.update_xaxes(showgrid=True, gridcolor="#E8D5B0",
+                                             gridwidth=0.5)
+                            fig.update_yaxes(showgrid=False)
+
+                            st.plotly_chart(fig, use_container_width=True,
+                                            key="main_chart")
+
+                            # Detail langsung dari hasil query (tidak perlu dropdown)
+
+                        # ── Donut chart untuk data kecil ─────────────
+                        elif tipe_chart == "pie":
+                            fig = px.pie(
+                                df,
+                                names=col_label,
+                                values=col_val,
+                                hole=0.45,
+                                color_discrete_sequence=px.colors.sequential.RdPu_r,
+                            )
+                            fig.update_traces(
+                                textposition="inside",
+                                textinfo="percent+label",
+                                hovertemplate=(
+                                    "<b>%{label}</b><br>"
+                                    "Jumlah: %{value:,}<br>"
+                                    "Porsi: %{percent}<extra></extra>"
+                                ),
+                            )
+                            fig.update_layout(
+                                height=420,
+                                showlegend=True,
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                font=dict(color="#2D0812"),
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                    else:
+                        # Tabel detail biasa — skip jika kartu detail sudah tampil
+                        if not _skip_table:
+                            st.dataframe(df, use_container_width=True, height=350)
+
+                    # Download selalu ada
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv,
+                        file_name="hasil_lks.csv",
+                        mime="text/csv",
+                    )
+
+                    # ── Kartu pembahasan berwarna jika ada kolom relevan ──
+                    _has_detail_cols = (
+                        "latar_belakang" in df.columns
+                        and tipe_chart not in ("metric", "pie", "bar")
+                    )
+                    if _has_detail_cols and len(df) > 0:
+                        render_detail_pembahasan(df)
+
+                # ── 🌳 TREE VIEW ──────────────────────────────────
+                KOLOM_TEKS = ["latar_belakang", "rekomendasi", "tindak_lanjut"]
+                ada_teks   = [c for c in KOLOM_TEKS if c in df.columns]
+
+                # Jika ada kolom teks tapi data terbatas (LIMIT 10), re-query tanpa limit
+                if ada_teks and len(df) > 0 and len(df) <= 10:
+                    try:
+                        with engine.connect() as _rc:
+                            _sql_full = re.sub(
+                                r"\bLIMIT\s+\d+", "LIMIT 2000", sql, flags=re.IGNORECASE
+                            )
+                            df = pd.read_sql(text(_sql_full), _rc)
+                    except Exception:
+                        pass  # pakai df yang ada jika re-query gagal
+
+                if ada_teks and len(df) > 0:
+                    st.markdown("<p style='font-family:DM Mono,monospace;font-size:0.68rem;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A5A;margin:1.5rem 0 0.75rem 0;'>Pengelompokkan Topik</p>", unsafe_allow_html=True)
+                    st.caption(
+                        "Baris dikelompokkan berdasarkan topik/frasa yang sering muncul. "
+                        "Pilih kolom lalu klik grup untuk melihat detailnya."
+                    )
+
+                    STOPWORDS = {
+                        "yang","dan","di","ke","dari","dengan","untuk","pada","dalam",
+                        "adalah","ini","itu","atau","juga","sudah","telah","akan",
+                        "tidak","ada","oleh","para","agar","dapat","serta","karena",
+                        "namun","sebagai","sesuai","terkait","terdapat","bahwa","hal",
+                        "kami","unit","pln","bersama","bidang","lks","bipartit",
+                        "mengenai","menindaklanjuti","pembahasan","menyampaikan",
+                        "berdasarkan","saat","masih","belum","kepada","antara","tim",
+                        "anggota","pihak","dinas","meminta","memiliki","dilakukan",
+                        "tersebut","lebih","proses","pegawai","perlu","nomor","surat",
+                        "adanya","hasil",
+                    }
+                    FRASA_PRIORITAS = [
+                        "aplikasi e-sppd","esppd","e-sppd","e sppd",
+                        "reimburse","reimbursement","perjalanan dinas","optimasi biaya",
+                        "non diklat","non-diklat","tugas belajar","emergency exit",
+                        "printer","laptop","hardware","pkb","perjanjian kerja",
+                        "rekrutmen","rekrut","kesehatan","wellbeing","cuti","melahirkan",
+                        "lembur","overtime","pagu","anggaran","kompetensi",
+                        "pelatihan","diklat","jabatan","promosi","mutasi","pensiun","purna",
+                    ]
+
+                    def cari_frasa(teks):
+                        t = str(teks).lower()
+                        return [f for f in FRASA_PRIORITAS if f in t]
+
+                    def ekstrak_topik(seri, max_topik=8):
+                        from collections import Counter
+                        fc = Counter()
+                        for t in seri.dropna():
+                            for f in cari_frasa(t):
+                                fc[f] += 1
+                        topik = [f for f, _ in fc.most_common(max_topik)]
+                        if len(topik) < 3:
+                            semua = []
+                            for t in seri.dropna():
+                                kata = [k for k in re.findall(r"\b[a-zA-Z]{4,}\b", str(t).lower())
+                                        if k not in STOPWORDS]
+                                semua += [f"{kata[i]} {kata[i+1]}" for i in range(len(kata)-1)]
+                                semua += kata
+                            topik += [b for b, _ in Counter(semua).most_common(20)
+                                      if b not in topik][: max_topik - len(topik)]
+                        return topik[:max_topik]
+
+                    def tag_baris(teks, topik_list):
+                        t = str(teks).lower()
+                        for tp in topik_list:
+                            if tp in t:
+                                return tp
+                        return "lainnya"
+
+                    pilih_kolom = st.selectbox(
+                        "Tampilkan kolom:",
+                        options=ada_teks,
+                        format_func=lambda x: x.replace("_", " ").title(),
+                        key="tree_kolom",
+                    )
+
+                    df_isi = df[
+                        df[pilih_kolom].notna() &
+                        (df[pilih_kolom].str.strip() != "")
+                    ].copy()
+
+                    if df_isi.empty:
+                        st.info("Tidak ada data untuk ditampilkan.")
+                    else:
+                        topik_list = ekstrak_topik(df_isi[pilih_kolom])
+                        df_isi["_topik"] = df_isi[pilih_kolom].apply(lambda t: tag_baris(t, topik_list))
+                        urutan = [t for t in topik_list if t in df_isi["_topik"].values]
+                        if "lainnya" in df_isi["_topik"].values:
+                            urutan += ["lainnya"]
+
+                        WARNA = ["#1565C0","#2E7D32","#6A1B9A","#BF360C","#00695C",
+                                 "#E65100","#4527A0","#283593","#558B2F","#AD1457","#888"]
+
+                        for i_tp, topik in enumerate(urutan):
+                            subset = df_isi[df_isi["_topik"] == topik]
+                            if subset.empty:
+                                continue
+                            n     = len(subset)
+                            w     = WARNA[i_tp % len(WARNA)] if topik != "lainnya" else "#888"
+                            areas = ""
+                            if "kode_area" in subset.columns:
+                                alist = sorted(subset["kode_area"].dropna().unique())[:12]
+                                areas = " ".join(
+                                    f"<span style='background:#EEE;color:#555;padding:0 5px;"
+                                    f"border-radius:3px;font-size:0.72rem;'>{a}</span>"
+                                    for a in alist
+                                )
+                            st.markdown(
+                                f"<div style='margin:12px 0 4px 0;'>"
+                                f"<span style='background:{w};color:white;padding:3px 12px;"
+                                f"border-radius:12px;font-size:0.82rem;font-weight:700;'>"
+                                f"📌 {topik.upper()}</span>"
+                                f"<span style='color:#888;font-size:0.8rem;margin-left:8px;'>"
+                                f"{n} baris</span> &nbsp;{areas}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            with st.expander(f"Lihat {n} detail →", expanded=False):
+                                for _, row in subset.iterrows():
+                                    ab = ""
+                                    if "kode_area" in row and pd.notna(row["kode_area"]):
+                                        ab = (f"<span style='background:#E3F2FD;color:#1565C0;"
+                                              f"padding:1px 7px;border-radius:4px;font-size:0.74rem;"
+                                              f"margin-right:6px;font-weight:600;'>{row['kode_area']}</span>")
+                                    raw   = str(row[pilih_kolom])
+                                    shown = raw[:300] + "…" if len(raw) > 300 else raw
+                                    st.markdown(
+                                        f"<div style='margin:4px 0;padding:6px 10px;"
+                                        f"border-left:3px solid {w};background:#FAFAFA;"
+                                        f"font-size:0.875rem;color:#333;border-radius:0 4px 4px 0;'>"
+                                        f"{ab}{shown}</div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                st.markdown("")
 
 # ── 👍👎 FEEDBACK (di luar if jalankan_btn agar selalu dirender) ──
 if st.session_state.get("history"):
