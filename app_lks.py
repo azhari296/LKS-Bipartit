@@ -1015,23 +1015,27 @@ def _list_dokumen_supabase() -> list[dict]:
 
 def _render_pdf_preview(url: str, height: int = 600):
     """
-    Preview PDF via data URI (base64), bukan iframe langsung ke URL remote.
-    Ini menghindari masalah CORS / X-Frame-Options / tracking-protection
-    browser yang sering berbeda perilaku antara localhost dan domain publik
-    (mis. *.streamlit.app), yang menyebabkan iframe gagal render meski
-    link "buka di tab baru" tetap berhasil.
+    Preview PDF via komponen `streamlit-pdf-viewer` (berbasis pdf.js).
+    Iframe biasa (baik ke URL remote maupun data-URI base64) sering
+    diblokir Content-Security-Policy di Streamlit Community Cloud —
+    banyak host memang melarang `frame-src data:`, sehingga muncul
+    ikon "broken file" meski file-nya valid. Komponen resmi Streamlit
+    tidak lewat batasan itu karena dikemas sebagai bidirectional
+    component, bukan raw <iframe src="data:...">.
     """
-    import base64
     try:
         resp = _req.get(url, timeout=20)
         resp.raise_for_status()
-        b64 = base64.b64encode(resp.content).decode("utf-8")
-        st.markdown(
-            f"<iframe src='data:application/pdf;base64,{b64}' "
-            f"width='100%' height='{height}px' "
-            f"style='border:1px solid #ddd;border-radius:8px;'></iframe>",
-            unsafe_allow_html=True,
-        )
+        try:
+            from streamlit_pdf_viewer import pdf_viewer
+            pdf_viewer(resp.content, height=height, width="100%")
+        except ImportError:
+            # Fallback kalau paket belum terpasang: tampilkan link saja
+            st.info(
+                "Paket `streamlit-pdf-viewer` belum terpasang — "
+                "preview tidak bisa ditampilkan langsung. "
+                "Tambahkan `streamlit-pdf-viewer` ke requirements.txt."
+            )
     except Exception as _e:
         st.warning(f"⚠️ Gagal memuat preview PDF ({_e}). Gunakan link di bawah.")
 
@@ -1260,6 +1264,17 @@ st.markdown("""
 }
 
 html, body, .stApp { background: var(--sand) !important; }
+/* Fix kontras dark-mode: paksa SEMUA elemen di dalam konten markdown
+   (bullet list, bold, italic, tabel, dsb — bukan cuma <p>/<h1-3>)
+   memakai warna --ink, supaya tidak "hilang" saat viewer memilih tema Dark. */
+[data-testid="stMarkdownContainer"],
+[data-testid="stMarkdownContainer"] * {
+  color: var(--ink) !important;
+}
+[data-testid="stMarkdownContainer"] a { color: var(--burg) !important; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * {
+  color: var(--muted) !important;
+}
 .block-container {
   max-width: 100% !important;
   padding: 1.5rem 3rem 5rem !important;
