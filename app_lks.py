@@ -763,17 +763,31 @@ TERLARANG = (
     "drop", "delete", "update", "insert",
     "alter", "truncate", "create", "replace",
     "grant", "revoke", "copy", "call", "exec",
+    "attach", "detach", "pragma", "vacuum", "reindex",
+    "union",
 )
 
 
 def validasi_sql(sql: str, maks_baris: int = 1000) -> str:
-    teks = sql.strip().rstrip(";").strip()
+    teks = sql.strip()
+
+    # Buang komentar SQL ('-- ...' dan '/* ... */') SEBELUM validasi,
+    # supaya kata terlarang tidak bisa disamarkan mis. "UPD/**/ATE"
+    teks = re.sub(r"/\*.*?\*/", " ", teks, flags=re.DOTALL)
+    teks = re.sub(r"--[^\n]*", " ", teks)
+
+    # Tolak multi-statement lebih dulu (sebelum trailing ';' dibuang)
+    _tanpa_akhir = teks.strip()
+    if _tanpa_akhir.endswith(";"):
+        _tanpa_akhir = _tanpa_akhir[:-1]
+    if ";" in _tanpa_akhir:
+        raise ValueError("❌ Multi-statement tidak diizinkan")
+
+    teks = _tanpa_akhir.strip()
     low  = teks.lower()
 
     if not low.lstrip().startswith("select"):
         raise ValueError("❌ Hanya SELECT yang diizinkan")
-    if ";" in teks and not teks.endswith(";"):
-        raise ValueError("❌ Multi-statement tidak diizinkan")
     for kata in TERLARANG:
         if re.search(rf"\b{kata}\b", low):
             raise ValueError(f"❌ Operasi terlarang: {kata}")
@@ -998,6 +1012,29 @@ def _list_dokumen_supabase() -> list[dict]:
             print(f"  ⚠️ {nama}: tidak bisa diakses")
     print(f"  Total manual: {len(hasil_manual)} file")
     return hasil_manual
+
+def _render_pdf_preview(url: str, height: int = 600):
+    """
+    Preview PDF via data URI (base64), bukan iframe langsung ke URL remote.
+    Ini menghindari masalah CORS / X-Frame-Options / tracking-protection
+    browser yang sering berbeda perilaku antara localhost dan domain publik
+    (mis. *.streamlit.app), yang menyebabkan iframe gagal render meski
+    link "buka di tab baru" tetap berhasil.
+    """
+    import base64
+    try:
+        resp = _req.get(url, timeout=20)
+        resp.raise_for_status()
+        b64 = base64.b64encode(resp.content).decode("utf-8")
+        st.markdown(
+            f"<iframe src='data:application/pdf;base64,{b64}' "
+            f"width='100%' height='{height}px' "
+            f"style='border:1px solid #ddd;border-radius:8px;'></iframe>",
+            unsafe_allow_html=True,
+        )
+    except Exception as _e:
+        st.warning(f"⚠️ Gagal memuat preview PDF ({_e}). Gunakan link di bawah.")
+
 
 def _baca_pdf_dari_url(url: str) -> str:
     """Download PDF dari URL Supabase dan ekstrak teks."""
@@ -2138,12 +2175,7 @@ if (jalankan_btn or _auto_run) and query:
                                     _furl = _get_public_url(_c)
                                     break
                         if _furl:
-                            st.markdown(
-                                f"<iframe src='{_furl}' width='100%' height='600px' "
-                                f"style='border:1px solid #ddd;border-radius:8px;'>"
-                                f"</iframe>",
-                                unsafe_allow_html=True,
-                            )
+                            _render_pdf_preview(_furl)
                             st.markdown(
                                 f"<a href='{_furl}' target='_blank' "
                                 f"style='font-size:0.85rem;'>↗ Buka di tab baru</a>",
